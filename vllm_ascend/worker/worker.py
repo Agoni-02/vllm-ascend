@@ -607,7 +607,7 @@ class NPUWorker(WorkerBase):
         self.torch_allocated = torch.npu.memory_allocated()
         self.torch_peak_allocated = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("
+            logger.debug(
                 "torch reserved memory: %.2f GiB, torch allocated memory: %.2f GiB, "
                 "torch peak allocated memory: %.2f GiB",
                 self.torch_reserved / GiB_bytes,
