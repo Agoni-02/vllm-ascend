@@ -567,11 +567,11 @@ class NPUWorker(WorkerBase):
             # so that graph pool allocations don't inflate the activation peak.
             # The memory_profiling context will also compute torch_peak_increase
             # on exit, but we override it below with this pre-graph value.
-            self.profile_torch_peak = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+            profile_torch_peak = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
 
         # Override torch_peak_increase with the pre-graph-capture value to
         # avoid double-counting graph pool memory as activation memory.
-        profile_result.torch_peak_increase = self.profile_torch_peak - profile_result.before_profile.torch_peak
+        profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
         )
@@ -600,13 +600,16 @@ class NPUWorker(WorkerBase):
         return int(self.available_kv_cache_memory_bytes)
 
     def profile_memory(self) -> None:
-        """Profiles the torch reserved memory, torch allocated memory, torch peak allocated memory in execute_model()."""
+        """
+        Profiles the torch reserved memory, torch allocated memory, torch peak allocated memory in execute_model().
+        """
         self.torch_reserved = torch.npu.memory_reserved()
         self.torch_allocated = torch.npu.memory_allocated()
         self.torch_peak_allocated = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "torch reserved memory: %.2f GiB, torch allocated memory: %.2f GiB, torch peak allocated memory: %.2f GiB",
+            logger.debug("
+                "torch reserved memory: %.2f GiB, torch allocated memory: %.2f GiB, "
+                "torch peak allocated memory: %.2f GiB",
                 self.torch_reserved / GiB_bytes,
                 self.torch_allocated / GiB_bytes,
                 self.torch_peak_allocated / GiB_bytes,
@@ -778,8 +781,8 @@ class NPUWorker(WorkerBase):
                 f"({format_gib(suggested_to_gpu_limit)} GiB) to fully utilize NPU "
                 f"free memory. Current KV cache memory: "
                 f"{format_gib(self.available_kv_cache_memory_bytes)} GiB."
-                f"Warmup stage memory: reserved {format_gib(torch.npu.memory_reserved())} GiB, "
-                f"allocated {format_gib(torch.npu.memory_allocated())} GiB."
+                f"After warmup: torch reserved memory {format_gib(torch.npu.memory_reserved())} GiB, "
+                f"torch allocated memory {format_gib(torch.npu.memory_allocated())} GiB."
             )
             logger.info(msg)
             # Reset peak memory after warmup to make sure get correct peak memory during inference.
