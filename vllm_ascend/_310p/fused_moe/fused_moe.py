@@ -25,8 +25,9 @@ from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
 from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
 from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import maybe_trans_nz, vllm_version_is
+from vllm_ascend.utils import maybe_trans_nz
 
 from .experts_selector import select_experts
 from .moe_comm_method import AllGatherCommImpl310
@@ -48,24 +49,13 @@ class AscendUnquantizedFusedMoEMethod310(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer):
         super().process_weights_after_loading(layer)
 
-        # vLLM PR #44589 landed after the v0.24 main-line cut point
-        # (798185d) and is present in the verified main commit only.
-        if not vllm_version_is("0.24.0"):
-            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2)
-            w13_data = maybe_trans_nz(w13_data)
-            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+        w13_data = maybe_trans_nz(w13_data)
+        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
 
-            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2)
-            w2_data = maybe_trans_nz(w2_data)
-            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
-        else:
-            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-            w13_data = maybe_trans_nz(w13_data)
-            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
-
-            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-            w2_data = maybe_trans_nz(w2_data)
-            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+        w2_data = maybe_trans_nz(w2_data)
+        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
     def apply(
         self,
@@ -132,6 +122,13 @@ class AscendUnquantizedFusedMoEMethod310(UnquantizedFusedMoEMethod):
         return final_hidden_states
 
 
+class AscendRoutedExperts310(AscendRoutedExperts):
+    def _get_quant_method(self, prefix, quant_config, moe_config):
+        if quant_config is None:
+            return AscendUnquantizedFusedMoEMethod310(moe_config)
+        return quant_config.get_quant_method(self, prefix, tid2eid=self.tid2eid)
+
+
 class AscendMoERunner310(AscendMoERunner):
     def __init__(
         self,
@@ -150,24 +147,20 @@ class AscendMoERunner310(AscendMoERunner):
         n_shared_experts: int = 0,
     ):
         super().__init__(
-            layer_name,
-            moe_config,
-            router,
-            routed_experts,
-            enable_dbo,
-            gate,
-            shared_experts,
-            shared_expert_gate,
-            routed_input_transform,
-            routed_output_transform,
-            routed_scaling_factor,
-            tid2eid,
-            n_shared_experts,
+            layer_name=layer_name,
+            moe_config=moe_config,
+            router=router,
+            routed_experts=routed_experts,
+            enable_dbo=enable_dbo,
+            gate=gate,
+            shared_experts=shared_experts,
+            shared_expert_gate=shared_expert_gate,
+            routed_input_transform=routed_input_transform,
+            routed_output_transform=routed_output_transform,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
-        if routed_experts.quant_config is None:
-            routed_experts.quant_method = AscendUnquantizedFusedMoEMethod310(self.moe_config)
-            self.quant_type = self._get_quant_type()
-
-        self.multistream_overlap_shared_expert = False
+        ascend_shared_experts = getattr(self, "ascend_shared_experts", None)
+        if ascend_shared_experts is not None:
+            ascend_shared_experts.multistream_overlap = False
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl310(self.moe_config)
