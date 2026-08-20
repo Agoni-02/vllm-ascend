@@ -180,6 +180,7 @@ def build_attn_metadata(
     graph_pad_size: int = -1,
     num_actual_tokens: int | None = None,
     num_input_tokens: int | None = None,
+    is_prefilling: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
@@ -234,6 +235,7 @@ def build_attn_metadata(
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
+            is_prefilling=is_prefilling,
             max_seq_len=max_seq_len,
             causal=group_causal,
             **common_attn_metadata_extra_kwargs,
@@ -256,7 +258,6 @@ def build_attn_metadata(
                     attn_metadata_extra_kwargs.update(
                         num_reqs_actual=num_reqs,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
-                        block_size=attn_group.kv_cache_spec.block_size,
                     )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
@@ -391,7 +392,7 @@ def _view_dsv4_cache(
 
     k_shape = attn_backend.get_kv_cache_shape(
         num_blocks,
-        kv_cache_spec.block_size,
+        kv_cache_spec.storage_block_size,
         kv_cache_spec.num_kv_heads,
         kv_cache_spec.head_size,
     )
@@ -404,7 +405,7 @@ def _view_dsv4_cache(
         scale_dtype = kv_cache_spec.scale_dtype
         scale_shape = attn_backend.get_kv_cache_shape(
             num_blocks,
-            kv_cache_spec.block_size,
+            kv_cache_spec.storage_block_size,
             kv_cache_spec.num_kv_heads,
             scale_dim,
         )
@@ -413,7 +414,7 @@ def _view_dsv4_cache(
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             full_shape = attn_backend.get_kv_cache_shape(
                 num_blocks,
-                kv_cache_spec.block_size,
+                kv_cache_spec.storage_block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size + scale_dim * get_dtype_size(scale_dtype),
             )
@@ -800,7 +801,7 @@ def _reshape_kv_cache_v2(
             if total_bytes % kv_cache_spec.page_size_bytes:
                 raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
             num_blocks = total_bytes // kv_cache_spec.page_size_bytes
-            num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+            num_blocks_per_kv_block = kv_cache_spec.storage_block_size // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
             kv_cache_shape = group.backend.get_kv_cache_shape(
                 kernel_num_blocks,
@@ -872,3 +873,26 @@ def build_attn_metadata_wrapper():
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = original_func
+
+
+@contextmanager
+def build_draft_attn_metadata_factory(positions, pad, is_prefilling):
+    """Wrap build_attn_metadata to forward rotary positions for the draft block.
+
+    The generic (Ascend) ``build_attn_metadata`` reads ``positions`` inside the
+    DSA/MLA ``build_decode_metadata`` for cos/sin, but the flat upstream
+    speculator path does not forward them. Must run inside
+    ``build_attn_metadata_wrapper()``.
+    """
+    raw = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata  # cache
+
+    def build_attn_metadata(*args, **kwargs):
+        kwargs["positions"] = positions[:pad]
+        kwargs["is_prefilling"] = is_prefilling
+        return raw(*args, **kwargs)
+
+    try:
+        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = build_attn_metadata
+        yield
+    finally:
+        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore

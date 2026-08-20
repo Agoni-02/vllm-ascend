@@ -1780,17 +1780,18 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if vllm_version_is("0.26.0"):
+        if vllm_version_is("0.27.1"):
             if self.vllm_config.model_config.enable_return_routed_experts and self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
 
-        if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing:
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
+        if profiling_chunk_config.enabled and profiling_chunk_config.need_timing:
             # Check if the scheduler signaled that calibration is complete.
             # This flag is set cross-process via scheduler_output because
             # modifying the config singleton in the scheduler process does
             # not affect this worker process.
             if getattr(scheduler_output, "disable_profiling_timing", False):
-                self.ascend_config.scheduler_config.profiling_chunk_config.need_timing = False
+                profiling_chunk_config.need_timing = False
             else:
                 self._sync_device()
                 self._execution_start_time = time.perf_counter()
@@ -2089,9 +2090,9 @@ class NPUModelRunner(GPUModelRunner):
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
-        # vLLM 0.26.0 still supports runtime KV scale calculation. Upstream main
+        # vLLM v0.27.1 still supports runtime KV scale calculation. Upstream main
         # removed this state in vllm-project/vllm#49389.
-        if vllm_version_is("0.26.0") and self.calculate_kv_scales:  # type: ignore[has-type]
+        if vllm_version_is("0.27.1") and self.calculate_kv_scales:  # type: ignore[has-type]
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
@@ -2205,6 +2206,7 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -2365,8 +2367,10 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
-        if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
-            self, "_execution_start_time"
+        if (
+            profiling_chunk_config.enabled
+            and profiling_chunk_config.need_timing
+            and hasattr(self, "_execution_start_time")
         ):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
@@ -3041,7 +3045,6 @@ class NPUModelRunner(GPUModelRunner):
                 extra_attn_metadata_args = dict(
                     num_reqs_actual=num_reqs,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
-                    block_size=attn_group.kv_cache_spec.block_size,
                 )
 
             if (for_cudagraph_capture
@@ -4174,7 +4177,7 @@ class NPUModelRunner(GPUModelRunner):
                         f"num_blocks: {num_blocks} should be equal to " \
                         f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                        num_blocks, current_kv_cache_spec.block_size,
+                        num_blocks, current_kv_cache_spec.storage_block_size,
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size)
                     kv_cache_shape_list = [kv_cache_shape]
@@ -4184,13 +4187,13 @@ class NPUModelRunner(GPUModelRunner):
                     if hasattr(current_kv_cache_spec, "scale_dim") and current_kv_cache_spec.scale_dim != 0:
                         indexer_k_shape = kv_cache_shape
                         indexer_scale_shape = self.attn_backend.get_kv_cache_shape(
-                                                num_blocks, current_kv_cache_spec.block_size,
+                                                num_blocks, current_kv_cache_spec.storage_block_size,
                                                 current_kv_cache_spec.num_kv_heads,
                                                 current_kv_cache_spec.scale_dim
                                                 )
                         if get_ascend_device_type() in {AscendDeviceType.A5}:
                             indexer_full_shape = self.attn_backend.get_kv_cache_shape(
-                                num_blocks, current_kv_cache_spec.block_size,
+                                num_blocks, current_kv_cache_spec.storage_block_size,
                                 current_kv_cache_spec.num_kv_heads,
                                 current_kv_cache_spec.head_size
                                 + current_kv_cache_spec.scale_dim
@@ -4491,11 +4494,12 @@ class NPUModelRunner(GPUModelRunner):
         Args:
             kv_cache_config: The KV cache configuration.
         """
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
-            for kv_cache_group in kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        non_encoder_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
         ]
+        block_sizes = [group.kv_cache_spec.block_size for group in non_encoder_groups]
 
         # Generate kernel_block_sizes that matches each block_size
         # For attention backends that support virtual block splitting,
@@ -4531,12 +4535,11 @@ class NPUModelRunner(GPUModelRunner):
 
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
-        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
-                continue
+        for kv_cache_group in non_encoder_groups:
             max_num_blocks_per_req = cdiv(
                 max_model_len,
-                block_sizes[i] * get_decode_context_model_parallel_world_size(),
+                kv_cache_group.kv_cache_spec.block_size
+                * get_decode_context_model_parallel_world_size(),
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
