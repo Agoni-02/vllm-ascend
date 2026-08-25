@@ -2,7 +2,9 @@
 
 不要 `python3 setup.py build_ext --inplace`（会先编整包 aclnn）。
 
-只改 `punica_npu.py` 时：**不要重编 `.so`**，覆盖 Python 后重启即可。
+改了 `sgmv_shrink.cpp` / `torch_binding.cpp` 必须重编两个 target。只改 `punica_npu.py` 才不用编 `.so`。
+
+FSL+TP 后每卡 rank 可能是 2：CopyOut 必须从 32 字节对齐的 UB 写出，禁止 `DataCopyPad(..., yOutLocal[s*R], ...)`。
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -15,8 +17,8 @@ cmake --build . --target vllm_ascend_kernels -j1
 cmake --build . --target vllm_ascend_C -j8
 ```
 
-把编出的 `libvllm_ascend_kernels.so`、`vllm_ascend_C*.so` 拷到当前 `import vllm_ascend` 的目录，重启 serve。
+把编出的 `libvllm_ascend_kernels.so`、`vllm_ascend_C*.so` 拷到当前 `import vllm_ascend` 的目录，覆盖 `punica_npu.py`，重启 serve。
 
-改动：`sgmv_shrink` 多截写出 `[n,T,R]`；`punica` packed 层一次 shrink。构图/decode 都必须走这条，**禁止** `torch.compiler.is_compiling()` 跳过融合。A 只用 `torch.cat`，不要 `data_ptr` 缓存。不要改 expand。
+构图/decode 都必须走 packed shrink，**禁止** `torch.compiler.is_compiling()` 跳过。A 用 `torch.cat(...).contiguous()`，不要 `data_ptr` 缓存。不要改 expand。
 
-验收（同一 decode 窗）：`sgmv_shrink` 592→约 304，`sgmv_expand` 仍约 592。构图图里可以有少量 cat；不应再出现方案1那种每步大量 Cat/Slice/`copy_`。tok/s 只对比 B1，到不了 B0。
+验收（同一 decode 窗）：`sgmv_shrink` 592→约 304，`sgmv_expand` 仍约 592。tok/s 只对比 B1，到不了 B0。

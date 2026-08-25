@@ -251,7 +251,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
     def _get_packed_lora_a(self, lora_a_stacked: tuple[torch.Tensor, ...]) -> torch.Tensor:
         # Always cat. Dynamo cannot trace data_ptr(); one cat in the graph is OK.
-        return torch.cat(list(lora_a_stacked), dim=-2)
+        return torch.cat(list(lora_a_stacked), dim=-2).contiguous()
 
     def add_expand(
         self,

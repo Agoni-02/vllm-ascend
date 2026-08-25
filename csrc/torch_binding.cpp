@@ -424,6 +424,7 @@ void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at
         slice_rank = static_cast<uint32_t>(y.size(2));
         lora_rank = num_slices * slice_rank;
         TORCH_CHECK(y.is_contiguous(), "3D y must be contiguous [n, T, R]");
+        TORCH_CHECK(weight.is_contiguous(), "packed LoRA A must be contiguous");
     }
     void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();

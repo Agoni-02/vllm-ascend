@@ -57,6 +57,9 @@ public:
         
         pipe_->InitBuffer(outQueueY_, 1, maxLoRARank_ * sizeof(Y_T));
         pipe_->InitBuffer(outBufferY_, maxLoRARank_ * sizeof(float));
+        // CopyOut must DataCopyPad from a 32-byte-aligned UB. yOutLocal[s*R] is
+        // unaligned when FSL shards rank (e.g. R=2, s=1 → 8 bytes).
+        pipe_->InitBuffer(sliceOutBuf_, maxLoRARank_ * sizeof(Y_T));
     }
 
     __aicore__ inline void Process()
@@ -206,12 +209,19 @@ private:
             uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(Y_T));
             DataCopyPad(yOutGm_[maxLoRARank_ * idx], yOutLocal, {1, blockLen, 0, 0});
         } else {
-            // y layout [n_slices, T, R]; each y[s] is contiguous [T, R]
+            // y layout [n_slices, T, R]; each y[s] is contiguous [T, R].
+            // Do not DataCopyPad from yOutLocal[s * R]: that LocalTensor view is
+            // not MTE-aligned when R * sizeof(Y_T) is not a multiple of 32.
+            AscendC::LocalTensor<Y_T> aligned = sliceOutBuf_.Get<Y_T>();
             uint16_t blockLen = static_cast<uint16_t>(sliceRank_ * sizeof(Y_T));
             for (uint32_t s = 0; s < numSlices_; s++) {
+                for (uint32_t r = 0; r < sliceRank_; r++) {
+                    aligned.SetValue(r, yOutLocal.GetValue(s * sliceRank_ + r));
+                }
+                AscendC::PipeBarrier<PIPE_ALL>();
                 uint64_t dst = static_cast<uint64_t>(s) * batchSize_ * sliceRank_
                                + static_cast<uint64_t>(idx) * sliceRank_;
-                DataCopyPad(yOutGm_[dst], yOutLocal[s * sliceRank_], {1, blockLen, 0, 0});
+                DataCopyPad(yOutGm_[dst], aligned, {1, blockLen, 0, 0});
             }
         }
         outQueueY_.FreeTensor(yOutLocal);
@@ -221,7 +231,7 @@ private:
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX_, inQueueW_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBufferX_, tmpBufferW_, outBufferY_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBufferX_, tmpBufferW_, outBufferY_, sliceOutBuf_;
     AscendC::GlobalTensor<X_T> xGm_;
     AscendC::GlobalTensor<W_T> wGm_;
     AscendC::GlobalTensor<int64_t> loraIndicesGm_;
