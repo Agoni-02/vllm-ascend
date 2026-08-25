@@ -226,9 +226,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        if self._c1_can_fuse_shrink(y, lora_a_stacked):
-            packed = self._get_packed_lora_a(lora_a_stacked)
-            # Keep 3D [n, T, R]; do not go through _apply_shrink's view(-1, R).
+        packed = kwargs.get("lora_a_packed")
+        # Packed A is a graph input built at set_lora. Never cat/contiguous/data_ptr here.
+        if (
+            packed is not None
+            and torch.is_tensor(y)
+            and y.dim() == 3
+            and y.size(0) > 1
+        ):
             self._shrink_prefill(y, x, packed, scale)
             return
         for slice_idx in range(len(lora_a_stacked)):
@@ -240,18 +245,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         r0 = lora_a_stacked[0].size(-2)
         h0 = lora_a_stacked[0].size(-1)
         return all(t.size(-2) == r0 and t.size(-1) == h0 for t in lora_a_stacked)
-
-    def _c1_can_fuse_shrink(self, y, lora_a_stacked: tuple[torch.Tensor, ...]) -> bool:
-        # Packed shrink must run in compiled decode too. Production decode is sgmv, not bgmv.
-        if not torch.is_tensor(y) or y.dim() != 3:
-            return False
-        if y.size(0) != len(lora_a_stacked) or y.size(0) <= 1:
-            return False
-        return self._c1_same_rank_hidden(lora_a_stacked)
-
-    def _get_packed_lora_a(self, lora_a_stacked: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        # Always cat. Dynamo cannot trace data_ptr(); one cat in the graph is OK.
-        return torch.cat(list(lora_a_stacked), dim=-2).contiguous()
 
     def add_expand(
         self,

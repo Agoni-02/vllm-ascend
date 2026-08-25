@@ -2,11 +2,16 @@
 
 不要 `python3 setup.py build_ext --inplace`。
 
-## 现网结论（2026-08-25）
+## 现网（2026-08-25）
 
 核 `[n,T,R]` + FSL 对齐 CopyOut（`sliceOutBuf_`）已接到：shrink 592→304、2.97→2.20 ms；expand 仍 592。  
-热路径 `torch.cat().contiguous()` 使 Cat 48→224，数据集 TPOT 21.0→22.1、tok/s 44.4→42.4。  
-**下一步 C1-pack：只改 punica，不重编 `.so`。** 禁止 `is_compiling` 跳过、禁止 `data_ptr`。Cat 须回到约 48。
+热路径 `torch.cat().contiguous()` 曾使 Cat 48→224，数据集 TPOT 21.0→22.1、tok/s 44.4→42.4。
+
+**当前 C1-pack（只改 Python，不重编 `.so`）：**
+- `vllm_ascend/lora/punica_npu.py`：`add_shrink` 只用 `lora_a_packed`，禁止每步 cat / `data_ptr` / `is_compiling` 跳过
+- `vllm_ascend/lora/utils.py`：`set_lora` / `set_mapping` 时把同 rank 的 A `copy_` 进 `_c1_packed_lora_a`，FSL `_mcp_apply` 把它当图输入
+
+验收：shrink 仍约 304，expand 仍约 592，Cat 回到约 48，TPOT/tok/s 只许相对 B1（21.0 / 44.4）持平或更好。TTFT 不当成功。禁止宣称拉回 B0。
 
 ## 编核（仅改 cpp 时）
 
