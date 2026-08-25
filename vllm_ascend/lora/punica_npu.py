@@ -254,12 +254,16 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         return self._c1_same_rank_hidden(lora_a_stacked)
 
     def _get_packed_lora_a(self, lora_a_stacked: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        key = tuple((t.data_ptr(), t._version) for t in lora_a_stacked)
+        # Dynamo fullgraph cannot trace tensor.data_ptr() (DataPtrVariable has no type).
+        # In compile, one torch.cat is a graph node. In eager, cache by object identity + _version.
+        if torch.compiler.is_compiling():
+            return torch.cat(list(lora_a_stacked), dim=-2)
+        versions = tuple(int(t._version) for t in lora_a_stacked)
         cache = getattr(self, "_c1_packed_a_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
+        if cache is not None and cache[0] is lora_a_stacked and cache[1] == versions:
+            return cache[2]
         packed = torch.cat(list(lora_a_stacked), dim=-2)
-        self._c1_packed_a_cache = (key, packed)
+        self._c1_packed_a_cache = (lora_a_stacked, versions, packed)
         return packed
 
     def add_expand(
