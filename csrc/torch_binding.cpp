@@ -407,8 +407,24 @@ void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at
     TORCH_CHECK(x.dim() == 2, "x should be [batch_size, hidden_in]");
     TORCH_CHECK(weight.dim() == 3 || weight.dim() == 4,
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
-    TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
-    TORCH_CHECK(x.size(1) > y.size(1), "hidden in should be greater than hidden out");
+    TORCH_CHECK(y.dim() == 2 || y.dim() == 3,
+                "y should be [batch_size, hidden_out] or [n_slices, batch_size, slice_rank]");
+    uint32_t num_slices = 1;
+    uint32_t slice_rank = 0;
+    uint32_t lora_rank = 0;
+    if (y.dim() == 2) {
+        TORCH_CHECK(x.size(0) == y.size(0), "x and y batch size should match");
+        TORCH_CHECK(x.size(1) > y.size(1), "hidden in should be greater than hidden out");
+        slice_rank = static_cast<uint32_t>(y.size(1));
+        lora_rank = slice_rank;
+    } else {
+        TORCH_CHECK(y.size(1) == x.size(0), "y[n, T, R] T should match x batch");
+        TORCH_CHECK(x.size(1) > y.size(2), "hidden in should be greater than slice rank");
+        num_slices = static_cast<uint32_t>(y.size(0));
+        slice_rank = static_cast<uint32_t>(y.size(2));
+        lora_rank = num_slices * slice_rank;
+        TORCH_CHECK(y.is_contiguous(), "3D y must be contiguous [n, T, R]");
+    }
     void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();
     void* lora_indices_ptr = lora_indices.data_ptr();
@@ -418,14 +434,13 @@ void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at
     void* y_ptr = y.data_ptr();
     int batch_size = x.size(0);
     int input_hidden_token = x.size(1);
-    uint32_t lora_rank = y.size(1);
     float scale_f = static_cast<float>(scale);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand cmd;
     cmd.Name("sgmv_shrink");
     cmd.SetCustomHandler([scalar_type, stream, x_ptr, weight_ptr, lora_indices_ptr, lora_indices_size,
                           seq_len_ptr, seq_len_size, y_ptr,
-                          batch_size, input_hidden_token, lora_rank, scale_f]() -> int {
+                          batch_size, input_hidden_token, lora_rank, scale_f, num_slices, slice_rank]() -> int {
         auto dtype = get_dtype_from_torch(scalar_type);
         int device_id = 0;
         int64_t aiv_num = 0;
@@ -434,7 +449,7 @@ void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at
         TORCH_CHECK("num_tokens_per_core != 0", "num_tokens_per_core should not be 0");
         sgmv_shrink_impl(dtype, stream, x_ptr, weight_ptr, lora_indices_ptr, lora_indices_size, seq_len_ptr, seq_len_size,
                          y_ptr, batch_size,
-                         num_tokens_per_core, input_hidden_token, lora_rank, scale_f);
+                         num_tokens_per_core, input_hidden_token, lora_rank, scale_f, num_slices, slice_rank);
         return 0;
     });
     cmd.Run();

@@ -68,7 +68,9 @@ namespace vllm_ascend {
         uint32_t num_tokens_per_core,
         uint32_t input_hidden_dim,
         uint32_t lora_rank,
-        float scale);
+        float scale,
+        uint32_t num_slices,
+        uint32_t slice_rank);
 
     extern void sgmv_expand_impl(
         AscendType type,

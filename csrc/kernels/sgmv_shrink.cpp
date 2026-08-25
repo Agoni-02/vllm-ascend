@@ -32,12 +32,14 @@ public:
     __aicore__ inline void Init(__gm__ void *x, __gm__ void *weight, __gm__ void *loraIndices, uint32_t loraIndicesSize,
                                 __gm__ void *seqLen, uint32_t seqLenSize,
                                 __gm__ void *y, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim,
-                                uint32_t maxLoRARank, float scale)
+                                uint32_t maxLoRARank, float scale, uint32_t numSlices, uint32_t sliceRank)
     {
         batchSize_ =  batchSize;
         numTokensPerCore_ = numTokensPerCore;
         inputHiddenDim_ = inputHiddenDim;
         maxLoRARank_ = maxLoRARank;
+        numSlices_ = numSlices == 0 ? 1 : numSlices;
+        sliceRank_ = sliceRank == 0 ? maxLoRARank : sliceRank;
         scale_ = scale;
         singleLoRAWeightLen_ = inputHiddenDim_ * maxLoRARank_;
         incremental_ = inputHiddenDim_ > TILE_LENGTH;
@@ -200,8 +202,18 @@ private:
     __aicore__ inline void CopyOut(const int64_t idx)
     {
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.DeQue<Y_T>();
-        uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(Y_T));
-        DataCopyPad(yOutGm_[maxLoRARank_ * idx], yOutLocal, {1, blockLen, 0, 0});
+        if (numSlices_ <= 1) {
+            uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(Y_T));
+            DataCopyPad(yOutGm_[maxLoRARank_ * idx], yOutLocal, {1, blockLen, 0, 0});
+        } else {
+            // y layout [n_slices, T, R]; each y[s] is contiguous [T, R]
+            uint16_t blockLen = static_cast<uint16_t>(sliceRank_ * sizeof(Y_T));
+            for (uint32_t s = 0; s < numSlices_; s++) {
+                uint64_t dst = static_cast<uint64_t>(s) * batchSize_ * sliceRank_
+                               + static_cast<uint64_t>(idx) * sliceRank_;
+                DataCopyPad(yOutGm_[dst], yOutLocal[s * sliceRank_], {1, blockLen, 0, 0});
+            }
+        }
         outQueueY_.FreeTensor(yOutLocal);
     }
 
@@ -219,6 +231,8 @@ private:
     uint32_t numTokensPerCore_;
     uint32_t inputHiddenDim_;
     uint32_t maxLoRARank_;
+    uint32_t numSlices_;
+    uint32_t sliceRank_;
     float scale_;
     uint32_t singleLoRAWeightLen_;
     int64_t reqLoRAIndex_;
@@ -232,12 +246,13 @@ private:
                                                              __gm__ void* seqLen, uint32_t seqLenSize,                 \
                                                              __gm__ void* y, uint32_t batchSize,                       \
                                                              uint32_t numTokensPerCore, uint32_t inputHiddenDim,       \
-                                                             uint32_t maxLoRARank, float scale)                        \
+                                                             uint32_t maxLoRARank, float scale,                        \
+                                                             uint32_t numSlices, uint32_t sliceRank)                   \
     {                                                                                                                  \
         AscendC::TPipe pipe;                                                                                           \
         SGMVShrink<TYPE> op(&pipe);                                                                                    \
         op.Init(x, weight, loraIndices, loraIndicesSize, seqLen, seqLenSize,                                           \
-            y, batchSize, numTokensPerCore, inputHiddenDim, maxLoRARank, scale);                                       \
+            y, batchSize, numTokensPerCore, inputHiddenDim, maxLoRARank, scale, numSlices, sliceRank);                 \
         op.Process();                                                                                                  \
     }
 
@@ -252,21 +267,21 @@ extern void sgmv_shrink_impl(AscendType type, void* stream, void* x, void* weigh
                              void* loraIndices, uint32_t loraIndicesSize,
                              void* seqLen, uint32_t seqLenSize,
                              void* y, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim,
-                             uint32_t maxLoRARank, float scale)
+                             uint32_t maxLoRARank, float scale, uint32_t numSlices, uint32_t sliceRank)
 {
     uint32_t blockDim = (batchSize + numTokensPerCore - 1) / numTokensPerCore;
     if (type == AscendType::FP16) {
         sgmv_shrink_half<<<blockDim, nullptr, stream>>>(x, weight, loraIndices, loraIndicesSize, seqLen, seqLenSize, 
                                                         y, batchSize, 
                                                         numTokensPerCore, inputHiddenDim, maxLoRARank,
-                                                        scale);
+                                                        scale, numSlices, sliceRank);
     } else if (type == AscendType::BF16) {
         #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
         sgmv_shrink_bfloat16_t<<<blockDim, nullptr, stream>>>(x, weight, loraIndices, loraIndicesSize, 
                                                                   seqLen, seqLenSize, 
                                                                   y, batchSize,
                                                                   numTokensPerCore, inputHiddenDim, maxLoRARank,
-                                                                  scale);
+                                                                  scale, numSlices, sliceRank);
         #endif
     } else {
         return;

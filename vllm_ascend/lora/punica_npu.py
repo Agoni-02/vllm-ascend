@@ -226,9 +226,41 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        # TODO fuse these kernels
+        if self._c1_can_fuse_shrink(y, lora_a_stacked):
+            packed = self._get_packed_lora_a(lora_a_stacked)
+            # Keep 3D [n, T, R]; do not go through _apply_shrink's view(-1, R).
+            self._shrink_prefill(y, x, packed, scale)
+            return
         for slice_idx in range(len(lora_a_stacked)):
             self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
+
+    def _c1_same_rank_hidden(self, lora_a_stacked: tuple[torch.Tensor, ...]) -> bool:
+        if len(lora_a_stacked) <= 1:
+            return False
+        r0 = lora_a_stacked[0].size(-2)
+        h0 = lora_a_stacked[0].size(-1)
+        return all(t.size(-2) == r0 and t.size(-1) == h0 for t in lora_a_stacked)
+
+    def _c1_can_fuse_shrink(self, y, lora_a_stacked: tuple[torch.Tensor, ...]) -> bool:
+        # Fused 3D path is sgmv CopyOut only. Keep the bgmv decode loop unchanged.
+        if not self.is_prefill:
+            return False
+        if not torch.is_tensor(y) or y.dim() != 3:
+            return False
+        if y.size(0) != len(lora_a_stacked) or y.size(0) <= 1:
+            return False
+        if not y.is_contiguous() or y.stride(-1) != 1:
+            return False
+        return self._c1_same_rank_hidden(lora_a_stacked)
+
+    def _get_packed_lora_a(self, lora_a_stacked: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        key = tuple((t.data_ptr(), t._version) for t in lora_a_stacked)
+        cache = getattr(self, "_c1_packed_a_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        packed = torch.cat(list(lora_a_stacked), dim=-2)
+        self._c1_packed_a_cache = (key, packed)
+        return packed
 
     def add_expand(
         self,
@@ -332,12 +364,22 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         if buffer is None:
             r = lora_b_stacked[0].size(-1)
-            # We set the buffer to be float32 by default, consistent with the
-            # triton op
-            buffer = tuple(
-                torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device) for _ in range(len(output_slices))
-            )
-        self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
+            n = len(output_slices)
+            # Packed sgmv shrink writes [n, T, R] so expand still sees contiguous [T, R].
+            if n > 1 and self.is_prefill and self._c1_same_rank_hidden(lora_a_stacked):
+                buf = torch.empty((n, x.size(0), r), dtype=torch.float32, device=x.device)
+                self.add_shrink(buf, x, lora_a_stacked, scale, **kwargs)
+                buffer = tuple(buf[i] for i in range(n))
+            else:
+                # We set the buffer to be float32 by default, consistent with the
+                # triton op
+                buffer = tuple(
+                    torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
+                    for _ in range(n)
+                )
+                self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
+        else:
+            self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
 
     def add_lora_fused_moe(
