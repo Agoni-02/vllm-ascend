@@ -20,12 +20,12 @@ public:
     static constexpr uint64_t LORA_RANK_32 = 32;
     static constexpr uint64_t LORA_RANK_64 = 64;
     static constexpr int32_t BUFFER_NUM = 2;
-    static constexpr int32_t SHRINK_TILE = 4096;
+    static constexpr int32_t SHRINK_TILE = 8192;  // H=5120 one ReduceSum; 4096 vs shrink 11776 was 1 ulp
     static constexpr int32_t NUM_BYTES_PER_REPEAT = 256;
     static constexpr int32_t NUM_BLOCKS_PER_REPEAT = 8;
     static constexpr int32_t NUM_ELEMENTS_PER_REPEAT = NUM_BYTES_PER_REPEAT / sizeof(float);
     static constexpr int32_t MASK_COUNT = NUM_ELEMENTS_PER_REPEAT;
-    static constexpr int32_t W_IN_TILE_NUM_ELEMENTS = 4096;
+    static constexpr int32_t W_IN_TILE_NUM_ELEMENTS = 8192;  // match sgmv_expand.cpp
     static constexpr int32_t Y_OUT_TILE_NUM_ELEMENTS = 4096;
     static constexpr int32_t BLOCK_REDUCE_NUM_REPEATS = W_IN_TILE_NUM_ELEMENTS / NUM_ELEMENTS_PER_REPEAT;
     static constexpr int32_t PAIR_REDUCE_NUM_REPEATS_16 =
