@@ -399,8 +399,8 @@ private:
 
 #define SGMV_LORA_DECLARE(TYPE)                                                                                        \
     extern "C" __global__ __aicore__ void sgmv_lora_##TYPE(                                                            \
-        __gm__ void *x, __gm__ void *weightA, __gm__ void *weightB, __gm__ void *loraIndices,                          \
-        uint32_t loraIndicesSize, __gm__ void *seqLen, uint32_t seqLenSize, __gm__ void *y, uint32_t batchSize,        \
+        __gm__ void* x, __gm__ void* weightA, __gm__ void* weightB, __gm__ void* loraIndices,                          \
+        uint32_t loraIndicesSize, __gm__ void* seqLen, uint32_t seqLenSize, __gm__ void* y, uint32_t batchSize,        \
         uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank, uint32_t outputHiddenDim,            \
         uint32_t sliceOffset, uint32_t outputFullDim, float scale)                                                     \
     {                                                                                                                  \
@@ -413,8 +413,8 @@ private:
 
 #define BGMV_LORA_DECLARE(TYPE)                                                                                        \
     extern "C" __global__ __aicore__ void bgmv_lora_##TYPE(                                                            \
-        __gm__ void *x, __gm__ void *weightA, __gm__ void *weightB, __gm__ void *indices, uint32_t indicesSize,        \
-        __gm__ void *y, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank,  \
+        __gm__ void* x, __gm__ void* weightA, __gm__ void* weightB, __gm__ void* indices, uint32_t indicesSize,        \
+        __gm__ void* y, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t inputHiddenDim, uint32_t maxLoRARank,  \
         uint32_t outputHiddenDim, uint32_t sliceOffset, uint32_t outputFullDim, float scale)                           \
     {                                                                                                                  \
         AscendC::TPipe pipe;                                                                                           \
