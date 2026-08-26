@@ -34,6 +34,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 sgmv_shrink,
             )
         else:
+            from vllm_ascend.lora import lora_ops as _ascend_lora_ops
             from vllm_ascend.lora.lora_ops import (
                 bgmv_expand,
                 bgmv_expand_slice,
@@ -48,6 +49,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand = sgmv_expand
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
+        if get_ascend_device_type() == AscendDeviceType._310P or (
+            self.lora_config is not None and self.lora_config.max_lora_rank >= 128
+        ):
+            self.sgmv_lora = None
+            self.bgmv_lora = None
+        else:
+            self.sgmv_lora = getattr(_ascend_lora_ops, "sgmv_lora", None)
+            self.bgmv_lora = getattr(_ascend_lora_ops, "bgmv_lora", None)
 
     def update_metadata(
         self,
@@ -360,27 +369,74 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
+        a_use = kwargs.get("lora_a_full") or lora_a_stacked
+        if buffer is None and self._c2_try_fused(y, x, a_use, lora_b_stacked, output_slices, scale):
+            return
+
         if buffer is None:
             r = lora_b_stacked[0].size(-1)
             n = len(output_slices)
-            # Packed sgmv shrink writes [n, T, R] so expand still sees contiguous [T, R].
-            if n > 1 and self._c1_same_rank_hidden(lora_a_stacked):
-                buf = torch.empty((n, x.size(0), r), dtype=torch.float32, device=x.device)
-                self.add_shrink(buf, x, lora_a_stacked, scale, **kwargs)
-                # Keep 3D [n, T, R]; binding offsets into it. Do not tuple(buf[i]).
-                self.add_expand(y, buf, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
-                return
-            else:
-                # We set the buffer to be float32 by default, consistent with the
-                # triton op
-                buffer = tuple(
-                    torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
-                    for _ in range(n)
-                )
-                self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
+            buffer = tuple(
+                torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device) for _ in range(n)
+            )
+            self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         else:
             self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
+
+    @staticmethod
+    def _c2_rank_ok(lora_a: torch.Tensor, lora_b: torch.Tensor) -> bool:
+        r = int(lora_b.size(-1))
+        return r in (8, 16, 32, 64) and int(lora_a.size(-2)) == r
+
+    def _c2_try_fused(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        output_slices: tuple[int, ...],
+        scale: float,
+    ) -> bool:
+        """C2: one kernel per slice, y += (xA)B. Rank must be 8/16/32/64."""
+        fused = self.sgmv_lora if self.is_prefill else self.bgmv_lora
+        if fused is None:
+            return False
+        if not all(self._c2_rank_ok(a, b) for a, b in zip(lora_a_stacked, lora_b_stacked)):
+            return False
+        y_org = y
+        y2 = y.view(-1, y.shape[-1])
+        x2 = x.view(-1, x.shape[-1])
+        offset = 0
+        for i in range(len(lora_a_stacked)):
+            sl = output_slices[i]
+            if self.is_prefill:
+                if self.no_lora:
+                    return True
+                fused(
+                    x2,
+                    lora_a_stacked[i],
+                    lora_b_stacked[i],
+                    y2,
+                    *self.prefill_metadata,
+                    scale,
+                    offset,
+                    sl,
+                )
+            else:
+                fused(
+                    x2,
+                    lora_a_stacked[i],
+                    lora_b_stacked[i],
+                    y2,
+                    self._get_token_lora_indices(x2),
+                    scale,
+                    offset,
+                    sl,
+                )
+            offset += sl
+        y2 = y2.view_as(y_org)
+        return True
 
     def add_lora_fused_moe(
         self,

@@ -10,6 +10,8 @@ from vllm_ascend.lora.fused_moe import (
 
 # Eager-built contiguous A for C1 packed shrink. Graph input; never cat on decode.
 C1_PACKED_ATTR = "_c1_packed_lora_a"
+# FSL: all-gather A on rank dim at set_lora so C2 fused kernel sees full rank.
+C2_FULL_A_ATTR = "_c2_lora_a_full"
 _C1_HOOKS_INSTALLED = False
 _SKIP_NAME_PARTS = ("MoE", "Embedding", "Logits", "Vocab")
 
@@ -72,10 +74,41 @@ def pack_lora_a_inplace(layer) -> None:
         packed.narrow(-2, i * r, r).copy_(src)
 
 
+def unshard_lora_a_if_needed(layer) -> None:
+    """Eager: gather sharded A to full rank so decode fused kernel matches B."""
+    if torch.compiler.is_compiling():
+        return
+    stacked = getattr(layer, "lora_a_stacked", None)
+    bstack = getattr(layer, "lora_b_stacked", None)
+    if not isinstance(stacked, (tuple, list)) or not isinstance(bstack, (tuple, list)):
+        return
+    if not stacked or not bstack or not torch.is_tensor(stacked[0]):
+        return
+    r_a = stacked[0].size(-2)
+    r_b = bstack[0].size(-1)
+    if r_a >= r_b:
+        setattr(layer, C2_FULL_A_ATTR, tuple(stacked))
+        return
+    try:
+        from vllm.distributed import tensor_model_parallel_all_gather
+    except ImportError:
+        return
+    if tensor_model_parallel_all_gather is None:
+        return
+    full = []
+    for src in stacked:
+        # A is [..., rank, hidden]; gather last dim after transpose.
+        t = src.transpose(-1, -2).contiguous()
+        g = tensor_model_parallel_all_gather(t, dim=-1)
+        full.append(g.transpose(-1, -2).contiguous())
+    setattr(layer, C2_FULL_A_ATTR, tuple(full))
+
+
 def _wrap_after(orig):
     def wrapped(self, *args, **kwargs):
         out = orig(self, *args, **kwargs)
         pack_lora_a_inplace(self)
+        unshard_lora_a_if_needed(self)
         return out
 
     return wrapped
@@ -148,9 +181,31 @@ def _patch_mcp_apply():
             continue
 
         def _mcp_apply(x, bias, layer, _orig=orig):
+            a_full = getattr(layer, C2_FULL_A_ATTR, None)
+            b0 = layer.lora_b_stacked[0] if getattr(layer, "lora_b_stacked", None) else None
+            if (
+                a_full is not None
+                and b0 is not None
+                and int(a_full[0].size(-2)) == int(b0.size(-1))
+            ):
+                if hasattr(layer, "_get_quant_method"):
+                    output = layer._get_quant_method().apply(layer.base_layer, x, bias)
+                else:
+                    output = layer.base_layer.quant_method.apply(layer.base_layer, x, bias)
+                original_shape = output.shape if output.ndim == 3 else None
+                x2, y2 = x, output
+                if x.ndim == 3 and output.ndim == 3:
+                    y2 = output.flatten(0, 1)
+                    x2 = x.flatten(0, 1)
+                layer.punica_wrapper.add_lora_linear(
+                    y2, x2, a_full, layer.lora_b_stacked, 1.0, layer.output_slices
+                )
+                if original_shape is not None:
+                    return y2.reshape(original_shape)
+                return output
+
             packed = getattr(layer, C1_PACKED_ATTR, None)
             n = getattr(layer, "n_slices", 1)
-            # n==1 has no cat to remove. Missing all_gather: keep upstream.
             if n <= 1 or tensor_model_parallel_all_gather is None:
                 return _orig(x, bias, layer)
 
@@ -206,10 +261,13 @@ def _patch_add_lora_linear_sites(cls):
     from vllm.platforms import current_platform
 
     def _call_add_lora_linear(self, x, output):
-        packed = getattr(self, C1_PACKED_ATTR, None)
         kwargs = {}
+        packed = getattr(self, C1_PACKED_ATTR, None)
         if packed is not None:
             kwargs["lora_a_packed"] = packed
+        a_full = getattr(self, C2_FULL_A_ATTR, None)
+        if a_full is not None:
+            kwargs["lora_a_full"] = a_full
         return self.punica_wrapper.add_lora_linear(
             output,
             x,
