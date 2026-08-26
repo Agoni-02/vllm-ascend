@@ -87,8 +87,21 @@ def main():
     torch.ops._C_ascend.sgmv_lora(x, A, B, idx, seq, y_c2, scale, 0, O)
     torch.npu.synchronize()
     log("lora ok")
-    err = (y_c2.float() - y_ref.float()).abs().max().item()
+    diff = (y_c2.float() - y_ref.float()).abs()
+    err = diff.max().item()
+    per = diff.amax(dim=1)
+    worst = int(per.argmax().item())
+    n_bad = int((per > 1e-2).sum().item())
+    pos = int(diff.view(-1).argmax().item())
+    t_pos, h_pos = divmod(pos, O)
     log(f"max_abs_err={err:.6e} tokens={T} hidden={H} rank={R} out={O}")
+    log(
+        f"worst_token={worst} token_max={per[worst].item():.6e} "
+        f"n_tokens_gt_1e-2={n_bad} argmax=(t={t_pos},h={h_pos}) "
+        f"y_ref={y_ref[t_pos, h_pos].float().item():.6e} "
+        f"y_c2={y_c2[t_pos, h_pos].float().item():.6e}"
+    )
+    log(f"token0_max={per[0].item():.6e} token_last_max={per[-1].item():.6e}")
 
     def bench(fn):
         for _ in range(10):
