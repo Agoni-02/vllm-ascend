@@ -38,6 +38,7 @@ def bgmv_expand(
     output_tensor: torch.Tensor,
     lora_indices_tensor: torch.Tensor,
     add_inputs: bool = True,
+    x_slice_idx: int = 0,
 ):
     return torch.ops._C_ascend.bgmv_expand(
         inputs,
@@ -46,6 +47,7 @@ def bgmv_expand(
         output_tensor,
         0,
         output_tensor.size(1),
+        x_slice_idx,
     )
 
 
@@ -57,9 +59,10 @@ def bgmv_expand_slice(
     slice_offset: int,
     slice_size: int,
     add_inputs: bool = True,
+    x_slice_idx: int = 0,
 ):
     return torch.ops._C_ascend.bgmv_expand(
-        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset, slice_size
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset, slice_size, x_slice_idx
     )
 
 
@@ -91,6 +94,7 @@ def sgmv_expand(
     max_seq_length: int,
     token_nums: int,
     add_inputs: bool = False,
+    x_slice_idx: int = 0,
 ):
     return torch.ops._C_ascend.sgmv_expand(
         inputs,
@@ -100,6 +104,7 @@ def sgmv_expand(
         output_tensor,
         0,
         output_tensor.size(1),
+        x_slice_idx,
     )
 
 
@@ -116,7 +121,15 @@ def sgmv_expand_slice(
     slice_offset: int,
     slice_size: int,
     add_inputs: bool = False,
+    x_slice_idx: int = 0,
 ):
     return torch.ops._C_ascend.sgmv_expand(
-        inputs, lora_b_weights, lora_indices_tensor, seq_len_tensor, output_tensor, slice_offset, slice_size
+        inputs,
+        lora_b_weights,
+        lora_indices_tensor,
+        seq_len_tensor,
+        output_tensor,
+        slice_offset,
+        slice_size,
+        x_slice_idx,
     )

@@ -130,6 +130,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_offset: int,
         y_slice_size: int,
         add_inputs: bool,
+        x_slice_idx: int = 0,
     ):
         # No LoRA request, so return directly
         if self.no_lora:
@@ -142,6 +143,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             y_offset,
             y_slice_size,
             add_inputs,
+            x_slice_idx,
         )
 
     def _expand_slice_decode(
@@ -152,6 +154,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_offset: int,
         y_slice_size: int,
         add_inputs: bool,
+        x_slice_idx: int = 0,
     ):
         self.bgmv_expand_slice(
             x,
@@ -161,10 +164,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             y_offset,
             y_slice_size,
             add_inputs,
+            x_slice_idx,
         )
 
     def _get_token_lora_indices(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
+        ntok = x.size(1) if x.dim() == 3 else x.size(0)
+        return torch.narrow(self._token_lora_indices, 0, 0, ntok)
 
     def _apply_expand(
         self,
@@ -174,6 +179,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_offset: int,
         y_slice_size: int,
         add_inputs: bool = True,
+        x_slice_idx: int = 0,
     ):
         """
         Perform the ` y[:,y_offset:y_offset+y_slice_size]+=x@w_t_all`
@@ -182,7 +188,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         expand_slice_fun: Callable = self._expand_slice_prefill if self.is_prefill else self._expand_slice_decode
-        expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
+        expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs, x_slice_idx)
 
     def _apply_shrink(self, y: torch.Tensor, x: torch.Tensor, w_t_all: torch.Tensor, scale: float):
         """
@@ -276,14 +282,22 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_org = y
         y = y.view(-1, y.shape[-1])
         offset_left = offset_start
+        x_is_packed = torch.is_tensor(x) and x.dim() == 3
         for slice_idx in range(len(lora_b_stacked)):
+            if x_is_packed:
+                x_i = x
+                x_slice_idx = slice_idx
+            else:
+                x_i = x[slice_idx]
+                x_slice_idx = 0
             self._apply_expand(
                 y,
-                x[slice_idx],
+                x_i,
                 lora_b_stacked[slice_idx],
                 offset_left,
                 output_slices[slice_idx],
                 add_inputs=add_inputs,
+                x_slice_idx=x_slice_idx,
             )
             offset_left += output_slices[slice_idx]
         y = y.view_as(y_org)
@@ -353,7 +367,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             if n > 1 and self._c1_same_rank_hidden(lora_a_stacked):
                 buf = torch.empty((n, x.size(0), r), dtype=torch.float32, device=x.device)
                 self.add_shrink(buf, x, lora_a_stacked, scale, **kwargs)
-                buffer = tuple(buf[i] for i in range(n))
+                # Keep 3D [n, T, R]; binding offsets into it. Do not tuple(buf[i]).
+                self.add_expand(y, buf, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
+                return
             else:
                 # We set the buffer to be float32 by default, consistent with the
                 # triton op

@@ -353,32 +353,51 @@ void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Ten
     return;
 }
 
+// C1-exp: offset into contiguous [n, T, R] in C++ so Dynamo/ACL never lower buf[i] to Transpose.
+static void resolve_expand_x(const at::Tensor &x, int64_t x_slice_idx, void **x_ptr, int *batch_size, int *lora_rank)
+{
+    TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "expand x should be [T, R] or [n, T, R]");
+    if (x.dim() == 2) {
+        TORCH_CHECK(x_slice_idx == 0, "x_slice_idx must be 0 for 2D x");
+        *x_ptr = x.data_ptr();
+        *batch_size = static_cast<int>(x.size(0));
+        *lora_rank = static_cast<int>(x.size(1));
+        return;
+    }
+    TORCH_CHECK(x.is_contiguous(), "3D expand x must be contiguous [n, T, R]");
+    TORCH_CHECK(x_slice_idx >= 0 && x_slice_idx < x.size(0), "x_slice_idx out of range");
+    *batch_size = static_cast<int>(x.size(1));
+    *lora_rank = static_cast<int>(x.size(2));
+    int64_t nbytes = x_slice_idx * static_cast<int64_t>(*batch_size) * (*lora_rank) * x.element_size();
+    *x_ptr = static_cast<char *>(x.data_ptr()) + nbytes;
+}
+
 at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y,
-                       int64_t slice_offset, int64_t slice_size)
+                       int64_t slice_offset, int64_t slice_size, int64_t x_slice_idx)
 {
     at::ScalarType scalar_type = y.scalar_type();
     TORCH_CHECK(scalar_type == torch::kHalf || scalar_type == torch::kBFloat16, "only support half and bf16");
-    TORCH_CHECK(x.dim() == 2, "x should be [batch_size, hidden_in]");
     TORCH_CHECK(weight.dim() == 3 || weight.dim() == 4,
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
     TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
-    TORCH_CHECK(x.size(0) == y.size(0) && x.size(0) == indices.size(0),
+    void* x_ptr = nullptr;
+    int batch_size = 0;
+    int lora_rank = 0;
+    resolve_expand_x(x, x_slice_idx, &x_ptr, &batch_size, &lora_rank);
+    TORCH_CHECK(batch_size == y.size(0) && batch_size == indices.size(0),
                 "the first dimension of x, y, indices should be same");
-    TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
+    TORCH_CHECK(lora_rank <= slice_size, "hidden in should be smaller than hidden out");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
                 "slice_size + slice_offset should be smaller than the second dimension of y")
 
     at::Tensor y_out = y;
-    void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();
     void* indices_ptr = indices.data_ptr();
     int indices_size = indices.size(0);
     void* y_ptr = y.data_ptr();
     void* y_out_ptr = y_out.data_ptr();
-    int batch_size = x.size(0);
-    int lora_rank = x.size(1);
     int output_full_dim = y.size(1);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand cmd;
@@ -458,21 +477,24 @@ void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at
 }
 
 at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at::Tensor &seq_len,
-                       at::Tensor &y, int64_t slice_offset, int64_t slice_size)
+                       at::Tensor &y, int64_t slice_offset, int64_t slice_size, int64_t x_slice_idx)
 {
     at::ScalarType scalar_type = y.scalar_type();
     TORCH_CHECK(scalar_type == torch::kHalf || scalar_type == torch::kBFloat16, "only support half and bf16");
-    TORCH_CHECK(x.dim() == 2, "x should be [batch_size, hidden_in]");
     TORCH_CHECK(weight.dim() == 3 || weight.dim() == 4,
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
-    TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
+    void* x_ptr = nullptr;
+    int batch_size = 0;
+    int lora_rank = 0;
+    resolve_expand_x(x, x_slice_idx, &x_ptr, &batch_size, &lora_rank);
+    TORCH_CHECK(batch_size == y.size(0), "expand x batch should match y");
+    TORCH_CHECK(lora_rank <= slice_size, "hidden in should be smaller than hidden out");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
                 "slice_size + slice_offset should be smaller than the second dimension of y")
 
     at::Tensor y_out = y;
-    void* x_ptr = x.data_ptr();
     void* weight_ptr = weight.data_ptr();
     void* lora_indices_ptr = lora_indices.data_ptr();
     void* seq_len_ptr = seq_len.data_ptr();
@@ -480,8 +502,6 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
     int seq_len_size = seq_len.size(0);
     void* y_ptr = y.data_ptr();
     void* y_out_ptr = y_out.data_ptr();
-    int batch_size = x.size(0);
-    int lora_rank = x.size(1);
     int output_full_dim = y.size(1);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand cmd;
@@ -1980,7 +2000,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
-        "            int slice_offset, int slice_size) -> Tensor");
+        "            int slice_offset, int slice_size, int x_slice_idx=0) -> Tensor");
     ops.impl("bgmv_expand", torch::kPrivateUse1, &vllm_ascend::bgmv_expand);
 
     ops.def("sgmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y, float scale) -> ()");
@@ -1988,7 +2008,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "sgmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y,"
-        "            int slice_offset, int slice_size) -> Tensor");
+        "            int slice_offset, int slice_size, int x_slice_idx=0) -> Tensor");
     ops.impl("sgmv_expand", torch::kPrivateUse1, &vllm_ascend::sgmv_expand);
 
     ops.def(

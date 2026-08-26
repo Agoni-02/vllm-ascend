@@ -46,13 +46,13 @@ c10::SymInt ceil_div(const c10::SymInt& value, int64_t divisor)
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 at::Tensor bgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y,
-                        int64_t slice_offset, int64_t slice_size) {
+                        int64_t slice_offset, int64_t slice_size, int64_t x_slice_idx=0) {
     at::Tensor y_out = at::empty_like(y);
     return y_out;
 }
 
 at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at::Tensor &seq_len,
-                        at::Tensor &y, int64_t slice_offset, int64_t slice_size) {
+                        at::Tensor &y, int64_t slice_offset, int64_t slice_size, int64_t x_slice_idx=0) {
     at::Tensor y_out = at::empty_like(y);
     return y_out;
 }
