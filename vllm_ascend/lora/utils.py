@@ -113,7 +113,8 @@ def _code_names(fn) -> tuple[str, ...]:
 
 
 def _c3_overlap_enabled() -> bool:
-    return os.environ.get("VLLM_ASCEND_C3_OVERLAP", "1") != "0"
+    # Default off: decode graphs drop side-stream LoRA from y (base-model serve).
+    return os.environ.get("VLLM_ASCEND_C3_OVERLAP", "0") == "1"
 
 
 def _lora_stream():
