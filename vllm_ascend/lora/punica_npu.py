@@ -38,9 +38,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             from vllm_ascend.lora.lora_ops import (
                 bgmv_expand,
                 bgmv_expand_slice,
+                bgmv_lora,
                 bgmv_shrink,
                 sgmv_expand,
                 sgmv_expand_slice,
+                sgmv_lora,
                 sgmv_shrink,
             )
         self.bgmv_expand = bgmv_expand
@@ -49,6 +51,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand = sgmv_expand
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
+        if ascend_device_type == AscendDeviceType._310P or (
+            self.lora_config is not None and self.lora_config.max_lora_rank >= 128
+        ):
+            self.sgmv_lora = None
+            self.bgmv_lora = None
+        else:
+            self.sgmv_lora = sgmv_lora
+            self.bgmv_lora = bgmv_lora
         self._single_lora_slot = (
             ascend_device_type == AscendDeviceType.A3
             and self.lora_config is not None
@@ -344,6 +354,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
+        a_use = kwargs.get("full_rank_lora_a") or lora_a_stacked
+        if buffer is None and self._try_fused_lora_linear(y, x, a_use, lora_b_stacked, output_slices, scale):
+            return
+
         if self._apply_single_lora_linear(
             y,
             x,
@@ -365,6 +379,60 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             )
         self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
+
+    @staticmethod
+    def _fused_lora_rank_ok(lora_a: torch.Tensor, lora_b: torch.Tensor) -> bool:
+        r = int(lora_b.size(-1))
+        return r in (8, 16, 32, 64) and int(lora_a.size(-2)) == r
+
+    def _try_fused_lora_linear(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        output_slices: tuple[int, ...],
+        scale: float,
+    ) -> bool:
+        """One kernel per slice: y += (x @ A) @ B. Rank must be 8/16/32/64."""
+        fused = self.sgmv_lora if self.is_prefill else self.bgmv_lora
+        if fused is None:
+            return False
+        if not all(self._fused_lora_rank_ok(a, b) for a, b in zip(lora_a_stacked, lora_b_stacked)):
+            return False
+        y_org = y
+        y2 = y.view(-1, y.shape[-1])
+        x2 = x.view(-1, x.shape[-1])
+        offset = 0
+        for i in range(len(lora_a_stacked)):
+            sl = output_slices[i]
+            if self.is_prefill:
+                if self.no_lora:
+                    return True
+                fused(
+                    x2,
+                    lora_a_stacked[i],
+                    lora_b_stacked[i],
+                    y2,
+                    *self.prefill_metadata,
+                    scale,
+                    offset,
+                    sl,
+                )
+            else:
+                fused(
+                    x2,
+                    lora_a_stacked[i],
+                    lora_b_stacked[i],
+                    y2,
+                    self._get_token_lora_indices(x2),
+                    scale,
+                    offset,
+                    sl,
+                )
+            offset += sl
+        y2 = y2.view_as(y_org)
+        return True
 
     def _apply_single_lora_linear(
         self,
