@@ -113,6 +113,7 @@ def merge_postprocess_payload(
     result: Any,
     *,
     testcase_name: str,
+    case_key: str,
     suite_name: str | None = None,
 ) -> dict[str, Any]:
     """Deep-copy preset and patch nested fields per the preset JSON schema."""
@@ -128,13 +129,13 @@ def merge_postprocess_payload(
         payload["testcase_info"] = testcase_info
 
     testcase_info["featureFullName"] = suite_name or resolve_suite_name()
-    testcase_info["Testcase_Name"] = testcase_name
 
     test_env = testcase_info.get("testEnv")
     if not isinstance(test_env, dict):
         test_env = {}
         testcase_info["testEnv"] = test_env
 
+    test_env["case_key"] = case_key
     test_env["yaml_name"] = testcase_name
     test_env["request_rate"] = case_config.get("request_rate", 0)
     if "max_out_len" in case_config:
@@ -156,6 +157,10 @@ def merge_postprocess_payload(
         output_tps = _extract_output_tps(result)
         if output_tps is not None:
             indicator["output_tps"] = output_tps
+    elif case_type == "spec_decode" and isinstance(result, list):
+        indicator.update(
+            {f"acceptance_rate_pos_{position}": round(float(rate), 4) for position, rate in enumerate(result)}
+        )
     testcase_info["testIndicator"] = indicator
 
     return payload
@@ -230,6 +235,7 @@ def postprocess_one_benchmark(
         case_config,
         result,
         testcase_name=resolved_name,
+        case_key=case_key,
     )
 
     safe_job = _safe_name(job_name or "benchmark")
